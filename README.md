@@ -1,5 +1,10 @@
 # HeadMouse · 头动控制鼠标
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)
+![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B-green.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
+
 > 人机交互实验 4「体感操控」的自主实现：一颗普通摄像头 + 一台没有装任何驱动的电脑，
 > 用头部运动代替鼠标完成**移动、单击、双击**。等价于 Enable Viacam，但只有一个 Python 文件。
 
