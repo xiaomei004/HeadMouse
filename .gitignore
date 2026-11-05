@@ -8,3 +8,6 @@ venv/
 Thumbs.db
 *.bak
 截图*.png
+build/
+dist/
+*.spec

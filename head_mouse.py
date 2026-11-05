@@ -60,6 +60,7 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import os
+import sys
 import time
 
 import cv2
@@ -74,8 +75,15 @@ MOUSEEVENTF_LEFTUP = 0x0004
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
 SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL = os.path.join(HERE, "models", "yunet.onnx")
+# 资源根目录：源码运行时是脚本所在目录；PyInstaller 打包后是解包临时目录（_MEIPASS），
+# exe 单文件模式下 __file__ 指向临时解包路径，所以必须走 _MEIPASS 才能找到 models/。
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(os.path.abspath(sys.executable))   # exe 所在目录（用户可见）
+    RES = getattr(sys, "_MEIPASS", HERE)                      # 打包进去的资源目录
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    RES = HERE
+MODEL = os.path.join(RES, "models", "yunet.onnx")
 
 FRAME_W, FRAME_H = 640, 480
 ROI_X0, ROI_Y0, ROI_X1, ROI_Y1 = 0.28, 0.16, 0.72, 0.80   # 没检到脸时的兜底跟踪区
