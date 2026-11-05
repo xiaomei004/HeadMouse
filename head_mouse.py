@@ -27,7 +27,8 @@ HeadMouse —— 头动控制电脑（实验4 / 体感交互）
    O         以当前光标位置重新取原点
    T         切换 位置映射 / 速度映射
    X         切换 单击 / 双击
-   1/2/3     灵敏度 低 / 中 / 高（位置模式的有效行程）
+   H         开关 放大准星光环（默认开）
+   1/2/3     灵敏度 低 / 中 / 高（位置模式行程 / 速度模式满速）
    F8        暂停 / 继续（全局，窗口失焦也能按）
    F12       立即退出（全局，窗口失焦也能按）
    ESC / Q   退出（需窗口在前台）
@@ -41,6 +42,11 @@ HeadMouse —— 头动控制电脑（实验4 / 体感交互）
    1) 停留 0.8s 触发一次点击；
    2) 点击后必须再移动 REARM_PX 像素才允许下一次 —— 否则停在原地会连续点击
       （dwell click 的标配防误触，等于鼠标"松开再按"）。
+
+六、光标可见性
+   Windows 的系统指针最大只有 32~48 px，且颜色随主题变化。这里不动系统设置，
+   而是在指针周围叠一个"分层 + 点击穿透 + 置顶"的窗口画一圈高对比度准星
+   （黑-琥珀-黑圆环 + 四向刻度），深浅背景都能一眼看到；H 键可关。
 
 用法：
    python head_mouse.py                 # 正常使用
@@ -83,11 +89,17 @@ LOST_PAUSE = 2.5       # 连续丢脸多少秒自动暂停
 HIJACK_PX = 90         # 光标与程序设定值偏差超过它 == 真人接管了鼠标
 
 # ---- 速度映射参数 ----
-VEL_DEAD = 6.0         # 速度模式死区（头部像素）
-VEL_FULL = 26.0        # 达到这个偏移时给满速
-VEL_MAX = 1500.0       # 满速像素/秒
+VEL_DEAD = 7.0         # 速度模式死区（头部像素），小于它完全不动
+VEL_FULL = 45.0        # 偏移达到这么多像素时给满速（越大越"温"）
+VEL_MAX = 650.0        # 满速像素/秒（默认灵敏度）
+VEL_CURVE = 1.5        # 速度曲线指数：>1 让慢速段更细腻，避免一动就窜
+VEL_TABLE = {ord('1'): 380.0, ord('2'): 650.0, ord('3'): 1000.0}
 
 RANGE_TABLE = {ord('1'): 260.0, ord('2'): 160.0, ord('3'): 100.0}
+
+# ---- 光标光环（放大光标、提高对比度） ----
+HALO_SIZE = 136        # 光环画布边长（像素）
+HALO_RGB = (255, 215, 0)   # 亮琥珀色，深色/浅色背景都能看清
 
 
 # ============================ Win32 小工具 ============================
@@ -135,12 +147,18 @@ def clamp(v, lo, hi):
 
 
 class Cursor:
-    """封装光标读写，同时记录"我们自己设过的位置"，用于识别人工接管。"""
+    """封装光标读写，同时记录"我们自己设过的位置"，用于识别人工接管。
+
+    注意：`mouse_event` / `SetCursorPos` 之后立刻 `GetCursorPos` 读到的不一定是新位置
+    （输入队列有 1~2 帧延迟，鼠标加速还会改变实际增量）。所以这里不读回，
+    而是**按我们下发的增量推算** last，每帧开头再用一次真实读数校准。
+    """
 
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.origin = (0, 0)
-        self.last = None          # 上一次我们设定的坐标
+        self.last = None          # 我们推算出的当前坐标
+        self.cur = None           # 本帧开头读到的真实坐标
         self.fx = 0.0             # 相对移动的亚像素余量
         self.fy = 0.0
 
@@ -165,16 +183,21 @@ class Cursor:
         self.fy -= iy
         if self.enabled:
             user32.mouse_event(MOUSEEVENTF_MOVE, ix, iy, 0, 0)
-            self.last = get_cursor()
-        elif self.last is not None:
+        if self.last is not None:
             self.last = (self.last[0] + ix, self.last[1] + iy)
 
-    def hijacked(self, tol=HIJACK_PX):
-        """真人在用物理鼠标吗？必须在"本帧设新位置之前"调用。"""
-        if not self.enabled or self.last is None:
-            return False
+    def sync(self):
+        """读一次真实光标，返回"真实位置与推算位置的偏差"（像素）。"""
         x, y = get_cursor()
-        return abs(x - self.last[0]) > tol or abs(y - self.last[1]) > tol
+        self.cur = (x, y)
+        if not self.enabled or self.last is None:
+            return 0.0
+        return float(np.hypot(x - self.last[0], y - self.last[1]))
+
+    def adopt(self):
+        """偏差在容差内 -> 认为是我们自己动的，把推算位置校准到真实位置。"""
+        if self.cur is not None:
+            self.last = self.cur
 
 
 class GlobalKeys:
@@ -200,6 +223,175 @@ def mouse_click(double=False):
         time.sleep(double_click_interval())
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+# ---------------- 光标光环：把 32px 的系统指针"放大"成一个高对比度准星 ----------------
+#
+# 系统光标的最大尺寸由 SM_CXCURSOR 决定，改注册表要重登才生效，所以不动系统光标，
+# 而是叠一个「分层 + 点击穿透 + 置顶 + 不抢焦点」的窗口在指针周围：
+#   WS_EX_LAYERED     支持逐像素 alpha
+#   WS_EX_TRANSPARENT 鼠标事件穿透（点击直接落到下面的窗口）
+#   WS_EX_TOOLWINDOW  不出现在 Alt+Tab / 任务栏
+#   WS_EX_NOACTIVATE  永不抢焦点
+# 画一个"黑-琥珀-黑"三层圆环 + 四个方向刻度，深浅背景都看得清。
+
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+WS_POPUP = 0x80000000
+ULW_ALPHA = 0x00000002
+AC_SRC_OVER, AC_SRC_ALPHA = 0x00, 0x01
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
+                ("SourceConstantAlpha", ctypes.c_byte), ("AlphaFormat", ctypes.c_byte)]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                ("biPlanes", wt.WORD), ("biBitCount", wt.WORD),
+                ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wt.DWORD * 3)]
+
+
+def halo_pixels(size=HALO_SIZE, rgb=HALO_RGB):
+    """生成预乘 alpha 的 BGRA 位图：黑外环 + 琥珀主环 + 四向刻度。"""
+    c = size / 2.0
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    dx, dy = xx - c + 0.5, yy - c + 0.5
+    r = np.hypot(dx, dy)
+
+    a = np.zeros((size, size), np.float32)
+    bgr = np.zeros((size, size, 3), np.float32)
+
+    def paint(mask, color, alpha):
+        a[mask] = alpha
+        bgr[mask] = color
+
+    paint((r >= 56) & (r < 63), (0, 0, 0), 170)          # 最外淡黑描边
+    paint((r >= 46) & (r < 56), (0, 0, 0), 215)          # 黑环
+    paint((r >= 38) & (r < 46), (rgb[2], rgb[1], rgb[0]), 240)  # 琥珀主环
+    paint((r >= 34) & (r < 38), (0, 0, 0), 200)          # 内黑环，压住浅底
+
+    # 四个方向刻度：从圆环往外挑出去，像准星
+    arms = (((np.abs(dx) < 2.2) & (np.abs(dy) > 56) & (np.abs(dy) < 66))
+            | ((np.abs(dy) < 2.2) & (np.abs(dx) > 56) & (np.abs(dx) < 66)))
+    paint(arms, (0, 0, 0), 200)
+    arms_in = (((np.abs(dx) < 1.4) & (np.abs(dy) > 57) & (np.abs(dy) < 65))
+               | ((np.abs(dy) < 1.4) & (np.abs(dx) > 57) & (np.abs(dx) < 65)))
+    paint(arms_in, (rgb[2], rgb[1], rgb[0]), 245)
+
+    bgra = np.dstack([bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2], a])
+    # 预乘 alpha：Windows 的 ULW_ALPHA 要求颜色已乘过 alpha
+    bgra[:, :, :3] *= (a[:, :, None] / 255.0)
+    return np.ascontiguousarray(np.clip(bgra, 0, 255).astype(np.uint8))
+
+
+class HaloOverlay:
+    """跟随光标的高对比度光环。失败就静默降级（不影响主功能）。"""
+
+    def __init__(self, size=HALO_SIZE, enabled=True):
+        self.ok = False
+        self.size = size
+        self.hwnd = None
+        self.visible = False
+        self.pos = None
+        self.hdc_mem = None
+        if not enabled:
+            return
+        try:
+            self._create()
+            self.ok = True
+        except Exception as e:
+            print("[警告] 光标光环不可用（不影响头控）：%s" % e)
+
+    def _create(self):
+        gdi32 = ctypes.windll.gdi32
+        # 64 位下句柄可能超过 int32，所有参数必须显式声明为 void*
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO),
+                                           wt.UINT, ctypes.POINTER(ctypes.c_void_p),
+                                           ctypes.c_void_p, wt.DWORD]
+        gdi32.CreateDIBSection.restype = ctypes.c_void_p
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+        user32.UpdateLayeredWindow.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wt.POINT),
+            ctypes.POINTER(wt.SIZE), ctypes.c_void_p, ctypes.POINTER(wt.POINT),
+            wt.DWORD, ctypes.POINTER(BLENDFUNCTION), wt.DWORD]
+
+        ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        self.hwnd = user32.CreateWindowExW(
+            ex, "STATIC", "HeadMouseHalo", WS_POPUP,
+            0, 0, self.size, self.size, None, None, None, None)
+        if not self.hwnd:
+            raise OSError("CreateWindowExW 失败")
+
+        self.hdc_screen = user32.GetDC(None)
+        self.hdc_mem = gdi32.CreateCompatibleDC(self.hdc_screen)
+
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = self.size
+        bmi.bmiHeader.biHeight = -self.size     # 负数 = 自上而下，和 numpy 一致
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        bits = ctypes.c_void_p()
+        self.hbmp = gdi32.CreateDIBSection(
+            self.hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        if not self.hbmp:
+            raise OSError("CreateDIBSection 失败")
+        gdi32.SelectObject(self.hdc_mem, self.hbmp)
+
+        arr = halo_pixels(self.size)
+        ctypes.memmove(bits.value, arr.tobytes(), arr.nbytes)
+        self.blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+        self.size_box = wt.SIZE(self.size, self.size)
+        self.src = wt.POINT(0, 0)
+
+    def show_at(self, x, y):
+        if not self.ok:
+            return
+        if self.pos is not None and abs(x - self.pos[0]) < 1 and abs(y - self.pos[1]) < 1:
+            return
+        dst = wt.POINT(int(x) - self.size // 2, int(y) - self.size // 2)
+        user32.UpdateLayeredWindow(self.hwnd, self.hdc_screen, ctypes.byref(dst),
+                                   ctypes.byref(self.size_box), self.hdc_mem,
+                                   ctypes.byref(self.src), 0,
+                                   ctypes.byref(self.blend), ULW_ALPHA)
+        if not self.visible:
+            user32.ShowWindow(self.hwnd, 4)     # SW_SHOWNOACTIVATE
+            self.visible = True
+        self.pos = (int(x), int(y))
+
+    def hide(self):
+        if self.ok and self.visible:
+            user32.ShowWindow(self.hwnd, 0)
+            self.visible = False
+            self.pos = None
+
+    def close(self):
+        self.hide()
+        if self.ok and self.hwnd:
+            try:
+                user32.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
+            self.ok = False
 
 
 def fit_frame(frame, tw=FRAME_W, th=FRAME_H):
@@ -489,6 +681,8 @@ def main():
     ap.add_argument("--origin", choices=("cursor", "center"), default="cursor",
                     help="开始时光标原点取哪里：cursor=当前光标位置（默认），center=屏幕中心")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--no-halo", action="store_true", help="不显示放大光标的光环")
+    ap.add_argument("--vel-max", type=float, default=0.0, help="速度模式满速像素/秒（默认 650）")
     ap.add_argument("--autostart", action="store_true", help="启动即开始（演示/自测用）")
     ap.add_argument("--snapshot", default="", help="第 25 帧存一张带叠层的截图（写文档用）")
     ap.add_argument("--frames", type=int, default=0, help="跑满 N 帧后自动退出（自测用）")
@@ -517,14 +711,18 @@ def main():
     mp = Mapper()
     cursor = Cursor(enabled=not args.no_mouse)
     gk = GlobalKeys()
+    halo = HaloOverlay(enabled=(not args.no_halo and not args.no_mouse))
 
     print("[模型] 人脸检测：%s" % ("YuNet 已加载" if fb.enabled else "不可用，使用固定框"))
     print("[屏幕] 虚拟桌面 %dx%d @ (%d,%d)" % (VW, VH, VX, VY))
+    print("[光标] 放大准星光环：%s（H 键开关）" % ("开" if halo.ok else "不可用"))
 
     running = False
     mode = args.mode
     double_mode = False
     range_px = 160.0
+    vel_max = args.vel_max or VEL_MAX
+    halo_on = True
     still_t = 0.0
     cooldown = 0.0
     click_pos = None        # 上一次点击时光标所在的位置（用"净位移"判断是否重新武装）
@@ -533,6 +731,7 @@ def main():
     clicks_double = 0
     npts = 0
     lost_t = 0.0
+    hijack_n = 0            # 连续几帧检测到"光标不在我们推算的位置上"
     seeded_on_face = False
     last_reseed = 0.0
     prev_t = time.time()
@@ -544,25 +743,29 @@ def main():
 
     def start():
         """开始/继续：原点取当前光标位置，光标不会跳到屏幕中心。"""
-        nonlocal click_pos, armed, still_t
+        nonlocal click_pos, armed, still_t, hijack_n
         tr.reseed(gray)
         mp.lock(center)
         if args.origin == "center":
             cursor.move_abs(VX + VW // 2, VY + VH // 2)
         else:
             cursor.capture_origin()
+        cursor.sync()
+        cursor.adopt()
         click_pos = cursor.last
         armed = False       # 开始后先动一下才允许点击，避免按空格的瞬间误点
+        hijack_n = 0
         still_t = 0.0
 
-    win = ("HeadMouse  [SPACE]start/pause  [C]relock  [O]origin  "
-           "[T]mapping  [X]click/double  [1-3]speed  [F8]pause  [F12]quit")
+    win = ("HeadMouse  [SPACE]start/pause  [C]relock  [O]origin  [T]mapping  "
+           "[X]click/double  [H]halo  [1-3]speed  [F8]pause  [F12]quit")
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 760, 570)
     print("[启动] 摄像头已打开，窗口已弹出（标题 HeadMouse）。", flush=True)
     print("       空格 开始；F8 暂停（全局）；F12 退出（全局）；ESC 退出。", flush=True)
     print("       位置模式：头偏多少光标走多少，脸回中光标回原点。", flush=True)
-    print("       速度模式：头偏左光标持续左移，脸回中才停（T 键切换）。", flush=True)
+    print("       速度模式：头偏左光标持续左移，脸回中才停（T 键切换，1/2/3 调速）。", flush=True)
+    print("       光标周围会套一圈琥珀色准星，看不清可按 H 关掉。", flush=True)
 
     while True:
         ok, frame = cap.read()
@@ -620,10 +823,16 @@ def main():
                 pause_reason = "丢脸 %.1fs 自动暂停" % lost_t
                 print("[自动暂停] 连续 %.1f 秒没检到人脸，已交出鼠标" % lost_t)
             # 安全 2：真人抓鼠标 -> 自动暂停（本帧还没设新位置，比对才有意义）
-            elif cursor.hijacked():
-                running = False
-                pause_reason = "检测到手动接管"
-                print("[自动暂停] 光标被手动移动，判定人工接管，已交出鼠标（F8 恢复）")
+            # 单帧偏差可能是输入队列延迟，必须连续几帧都偏才算人工接管
+            elif cursor.sync() > HIJACK_PX:
+                hijack_n += 1
+                if hijack_n >= 3:
+                    running = False
+                    pause_reason = "检测到手动接管"
+                    print("[自动暂停] 光标被手动移动，判定人工接管，已交出鼠标（F8 恢复）")
+            else:
+                hijack_n = 0
+                cursor.adopt()
 
         # 人脸模型可用却检不到脸时，冻结光标：此时跟踪点在背景上，一动就是乱飞
         face_lost = (box is None and fb.enabled)
@@ -641,8 +850,8 @@ def main():
             else:
                 m = float(np.hypot(ox, oy))
                 if m > VEL_DEAD:
-                    gain = min(1.0, (m - VEL_DEAD) / VEL_FULL)
-                    speed = VEL_MAX * gain
+                    g = min(1.0, (m - VEL_DEAD) / VEL_FULL) ** VEL_CURVE
+                    speed = vel_max * g
                     cursor.move_rel(ox / m * speed * dt, oy / m * speed * dt)
 
             # 重新武装用"净位移"而不是"累计路程"：抖动来回抵消，不会把自己抖成可点击
@@ -676,6 +885,13 @@ def main():
                           % ("双击" if double_mode else "单击", clicks_single, clicks_double))
         else:
             still_t = 0.0
+
+        # 光标光环：只在真正接管光标的时候出现，暂停时立刻消失
+        if running and not face_lost and halo_on and cursor.enabled:
+            cx, cy = get_cursor()
+            halo.show_at(cx, cy)
+        else:
+            halo.hide()
 
         # ---------- 叠层 ----------
         if box is not None:
@@ -712,7 +928,7 @@ def main():
         cv2.rectangle(frame, (0, h - 46), (w, h), (0, 0, 0), -1)
         cv2.putText(frame, "pts:%d  head:%+.0f,%+.0f px  %s  clicks:%d (S%d/D%d)"
                     % (npts, ox, oy,
-                       ("range %.0f" % range_px) if mode == "pos" else "vmax %.0f" % VEL_MAX,
+                       ("range %.0f" % range_px) if mode == "pos" else "vmax %.0f" % vel_max,
                        total, clicks_single, clicks_double),
                     (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (240, 240, 240), 1, cv2.LINE_AA)
         cv2.putText(frame, "move:%.0f/%.0f px  %s  %s"
@@ -783,7 +999,14 @@ def main():
             print("[模式]", "双击" if double_mode else "单击")
         elif k in RANGE_TABLE:
             range_px = RANGE_TABLE[k]
-            print("[灵敏度] 有效行程 %.0f px" % range_px)
+            vel_max = VEL_TABLE[k]
+            print("[灵敏度] 位置模式行程 %.0f px / 速度模式满速 %.0f px/s"
+                  % (range_px, vel_max))
+        elif k in (ord('h'), ord('H')):
+            halo_on = not halo_on
+            if not halo_on:
+                halo.hide()
+            print("[光环]", "开" if halo_on else "关")
 
         if args.frames and frame_count >= args.frames:
             print("[自测] 已跑满 %d 帧，退出" % frame_count)
@@ -791,6 +1014,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    halo.close()
     return 0
 
 
